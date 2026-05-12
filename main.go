@@ -32,6 +32,7 @@ func root() *serpent.Command {
 		namespacesStr string
 		labelSelector string
 		metricsAddr   string
+		smartEvents   bool
 	)
 	cmd := &serpent.Command{
 		Use:   "coder-logstream-kube",
@@ -82,6 +83,14 @@ func root() *serpent.Command {
 				Default:     "",
 				Value:       serpent.StringOf(&metricsAddr),
 				Description: "Address to serve Prometheus metrics on. Set to empty to disable.",
+			},
+			{
+				Name:        "smart-events",
+				Flag:        "smart-events",
+				Env:         "CODER_LOGSTREAM_SMART_EVENTS",
+				Default:     "false",
+				Value:       serpent.BoolOf(&smartEvents),
+				Description: "Translate raw Kubernetes events into human-readable messages. Suppresses expected transient noise (autoscaler activity, image pulls) and escalates real failures. Default false for backwards compatibility.",
 			},
 		},
 		Handler: func(inv *serpent.Invocation) error {
@@ -135,8 +144,9 @@ func root() *serpent.Command {
 				fieldSelector: fieldSelector,
 				labelSelector: labelSelector,
 				logger:        logger,
-				maxRetries:    15, // 15 retries is the default max retries for a log send failure.
+				maxRetries:    15,
 				metrics:       metrics,
+				smartEvents:   smartEvents,
 			})
 			if err != nil {
 				return fmt.Errorf("create pod event reporter: %w", err)

@@ -44,6 +44,10 @@ type podEventLoggerOptions struct {
 
 	metrics *metricsCollector
 
+	// smartEvents enables human-readable event translation instead of raw k8s messages.
+	// When true, events are filtered through the event translator before being sent.
+	smartEvents bool
+
 	// The following fields are optional!
 	namespaces    []string
 	fieldSelector string
@@ -140,6 +144,10 @@ type podEventLogger struct {
 	closeOnce sync.Once
 	// doneChan is closed when the work goroutine exits
 	doneChan chan struct{}
+
+	// podStates tracks per-pod event translation state when smartEvents is enabled
+	podStatesMu sync.Mutex
+	podStates   map[string]*podEventState
 }
 
 // resolveEnvValue resolves the value of an environment variable, supporting both
@@ -366,6 +374,47 @@ func (p *podEventLogger) initNamespace(namespace string) error {
 				return
 			}
 
+			if p.smartEvents {
+				// Translate raw k8s event to human-readable message.
+				// May return nil (event should be silenced).
+				podName := event.InvolvedObject.Name
+				p.podStatesMu.Lock()
+				if p.podStates == nil {
+					p.podStates = map[string]*podEventState{}
+				}
+				state, ok := p.podStates[podName]
+				if !ok {
+					state = newPodEventState()
+					p.podStates[podName] = state
+				}
+				p.podStatesMu.Unlock()
+
+				interp := state.InterpretEvent(event, time.Now())
+				if interp == nil {
+					// Silenced — expected noise
+					p.logger.Debug(p.ctx, "suppressed k8s event",
+						slog.F("pod", podName),
+						slog.F("reason", event.Reason),
+						slog.F("message", event.Message))
+					return
+				}
+
+				for _, token := range tokens {
+					p.sendLog(podName, token, agentsdk.Log{
+						CreatedAt: time.Now(),
+						Output:    interp.UserMessage,
+						Level:     interp.Level,
+					})
+					p.logger.Info(p.ctx, "sending translated log",
+						slog.F("pod", podName),
+						slog.F("reason", event.Reason),
+						slog.F("phase", interp.Phase.String()),
+						slog.F("message", interp.UserMessage))
+				}
+				return
+			}
+
+			// Legacy mode: pipe raw k8s events verbatim
 			for _, token := range tokens {
 				p.sendLog(event.InvolvedObject.Name, token, agentsdk.Log{
 					CreatedAt: time.Now(),
