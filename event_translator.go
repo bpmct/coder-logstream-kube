@@ -159,7 +159,7 @@ func (s *podEventState) InterpretEvent(event *corev1.Event, now time.Time) *Even
 				return &EventInterpretation{
 					Kind:        KindSlowWarn,
 					Phase:       PhaseScheduling,
-					UserMessage: fmt.Sprintf("Still waiting for a node after %s. Autoscaler may be slow or at capacity.", elapsed.Round(time.Second)),
+					UserMessage: "Still waiting for a node — the cluster is scaling up in the background. No action needed.",
 					Level:       codersdk.LogLevelWarn,
 				}
 			}
@@ -316,7 +316,7 @@ func (s *podEventState) InterpretEvent(event *corev1.Event, now time.Time) *Even
 			return &EventInterpretation{
 				Kind:        KindSlowWarn,
 				Phase:       s.currentPhase,
-				UserMessage: fmt.Sprintf("Storage attachment is taking longer than expected (%s). Your disk may be re-attaching from another zone.", elapsed.Round(time.Second)),
+				UserMessage: "Storage is taking a while to attach — this can happen when re-attaching across zones. Hang tight.",
 				Level:       codersdk.LogLevelWarn,
 			}
 		}
@@ -370,15 +370,35 @@ func (s *podEventState) InterpretEvent(event *corev1.Event, now time.Time) *Even
 	}
 }
 
-// HeartbeatMessage returns a "still waiting" message if we've been in a slow
-// phase for a while with no updates. Returns empty string if no heartbeat needed.
+// schedulingHeartbeats and pullingHeartbeats are calm, rotating reassurances
+// used when a phase is taking longer than usual. No timers, no countdowns.
+var schedulingHeartbeats = []string{
+	"Your workspace is on its way…",
+	"Node is coming up, almost there…",
+	"Cluster is getting things ready for you…",
+	"Hang tight, a node is spinning up…",
+}
+
+var pullingHeartbeats = []string{
+	"Image is downloading, nearly ready…",
+	"Large image — still pulling, won't be long…",
+	"Almost there, image transfer in progress…",
+}
+
+// HeartbeatMessage returns a calm reassurance if we've been in a slow phase.
+// No countdowns or elapsed timers — just friendly progress nudges.
 func (s *podEventState) HeartbeatMessage(now time.Time) string {
 	elapsed := now.Sub(s.phaseEnteredAt)
-	// Only heartbeat during "expected waiting" phases
 	switch s.currentPhase {
-	case PhaseScheduling, PhasePulling:
+	case PhaseScheduling:
 		if elapsed > 60*time.Second && elapsed < 10*time.Minute {
-			return fmt.Sprintf("Still %s… (%s elapsed)", strings.ToLower(s.currentPhase.String()), elapsed.Round(time.Second))
+			idx := (int(elapsed.Seconds()) / 60) % len(schedulingHeartbeats)
+			return schedulingHeartbeats[idx]
+		}
+	case PhasePulling:
+		if elapsed > 45*time.Second && elapsed < 10*time.Minute {
+			idx := (int(elapsed.Seconds()) / 45) % len(pullingHeartbeats)
+			return pullingHeartbeats[idx]
 		}
 	}
 	return ""
