@@ -1,0 +1,86 @@
+# event_rules.yaml — simple 1:1 Kubernetes event reason → user message mappings.
+# These cover cases with no dynamic logic (no backoff counting, no thresholds,
+# no message extraction). The Go translator handles everything else.
+#
+# Fields per rule:
+#   reasons:  list of k8s event Reason strings this rule matches
+#   kind:     noise | progress | slow_warn | error
+#   phase:    unknown | scheduling | pulling | starting | running | failed | current
+#             "current" / "unknown" both mean: keep whatever phase we're already in
+#   level:    info | warn | error  (omitted for noise rules)
+#   message:  what the user sees  (omitted for noise rules)
+
+rules:
+  - reasons: [TriggeredScaleUp]
+    kind: progress
+    phase: scheduling
+    level: info
+    message: "Cluster is scaling up to accommodate your workspace — hang tight…"
+
+  - reasons: [NotTriggerScaleUp]
+    kind: error
+    phase: failed
+    level: error
+    message: "No available nodes and the cluster autoscaler can't scale up. Contact your administrator."
+
+  - reasons: [Created]
+    kind: progress
+    phase: starting
+    level: info
+    message: "Workspace container created, starting up…"
+
+  - reasons: [Started]
+    kind: progress
+    phase: running
+    level: info
+    message: "Workspace is running, waiting for agent to connect…"
+
+  - reasons: [Killing]
+    kind: progress
+    phase: current  # keep whatever phase the pod is in when it's stopped
+    level: info
+    message: "Workspace container is stopping"
+
+  - reasons: [OOMKilling, OOMKilled]
+    kind: error
+    phase: failed
+    level: error
+    message: "Workspace ran out of memory (OOMKilled). Try a template with more memory, or reduce your workload."
+
+  - reasons: [SuccessfulAttachVolume, SuccessfulMountVolume]
+    kind: progress
+    phase: current  # keep whatever phase we're already in
+    level: info
+    message: "Workspace storage attached successfully"
+
+  - reasons: [NodeNotReady, NodeNotSchedulable]
+    kind: noise
+    # Transient node flaps — always silenced
+
+  - reasons: [Preempting, Preempted]
+    kind: slow_warn
+    phase: scheduling
+    level: warn
+    message: "Workspace pod is being preempted by a higher-priority workload. It will be rescheduled shortly."
+
+  - reasons: [ErrImageNeverPull]
+    kind: error
+    phase: failed
+    level: error
+    message: "Image can't be pulled (imagePullPolicy=Never but image isn't present locally)."
+
+# Heartbeat messages shown when a phase stalls (rotated, no timers shown to user)
+heartbeats:
+  scheduling:
+    after_seconds: 60
+    messages:
+      - "Your workspace is on its way…"
+      - "Node is coming up, almost there…"
+      - "Cluster is getting things ready for you…"
+      - "Hang tight, a node is spinning up…"
+  pulling:
+    after_seconds: 45
+    messages:
+      - "Image is downloading, nearly ready…"
+      - "Large image — still pulling, won't be long…"
+      - "Almost there, image transfer in progress…"

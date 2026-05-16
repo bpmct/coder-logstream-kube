@@ -8,6 +8,10 @@
 //     from "real failures" (ImagePullBackOff after multiple attempts, OOMKilled, etc.)
 //   - Emit a single concise status line that updates in place (via phase tracking)
 //   - Emit a "still waiting…" heartbeat so users know progress is happening
+//
+// Simple 1:1 reason→message mappings live in event_rules.yaml (loaded via
+// event_rules_loader.go).  Cases requiring dynamic logic (backoff counting,
+// threshold checks, message extraction) are handled here.
 package main
 
 import (
@@ -83,9 +87,19 @@ type podEventState struct {
 	shownReasons     map[string]struct{}  // reasons we've already surfaced at least once
 	imagePullStart   map[string]time.Time // container → time pull started
 	backoffCount     map[string]int       // container/reason → consecutive count
+	staticRules      *StaticRules         // loaded from event_rules.yaml
 }
 
 func newPodEventState() *podEventState {
+	rules, err := LoadStaticRules()
+	if err != nil {
+		// Should never happen (YAML is embedded); fall back to empty rules
+		// rather than panicking so the binary still runs.
+		rules = &StaticRules{
+			byReason:   map[string]staticRule{},
+			heartbeats: map[Phase]HeartbeatConfig{},
+		}
+	}
 	return &podEventState{
 		currentPhase:     PhaseUnknown,
 		phaseEnteredAt:   time.Now(),
@@ -93,6 +107,7 @@ func newPodEventState() *podEventState {
 		shownReasons:     map[string]struct{}{},
 		imagePullStart:   map[string]time.Time{},
 		backoffCount:     map[string]int{},
+		staticRules:      rules,
 	}
 }
 
@@ -120,15 +135,6 @@ func (s *podEventState) InterpretEvent(event *corev1.Event, now time.Time) *Even
 			Phase:       PhaseScheduling,
 			UserMessage: "Workspace assigned to a node, preparing to start",
 			Level:       codersdk.LogLevelInfo,
-		}
-
-	case "NotTriggerScaleUp":
-		// Cluster autoscaler says no node is available and it won't scale. Real problem.
-		return &EventInterpretation{
-			Kind:        KindRealError,
-			Phase:       PhaseFailed,
-			UserMessage: "No available nodes and cluster autoscaler cannot scale up. Contact your administrator.",
-			Level:       codersdk.LogLevelError,
 		}
 
 	case "FailedScheduling":
@@ -165,14 +171,6 @@ func (s *podEventState) InterpretEvent(event *corev1.Event, now time.Time) *Even
 			}
 		}
 		return nil
-
-	case "TriggeredScaleUp":
-		return &EventInterpretation{
-			Kind:        KindProgress,
-			Phase:       PhaseScheduling,
-			UserMessage: "Cluster is scaling up to accommodate your workspace — hang tight…",
-			Level:       codersdk.LogLevelInfo,
-		}
 
 	// ── Image pull ───────────────────────────────────────────────────────────
 	case "Pulling":
@@ -260,41 +258,6 @@ func (s *podEventState) InterpretEvent(event *corev1.Event, now time.Time) *Even
 			Level:       codersdk.LogLevelError,
 		}
 
-	// ── Container lifecycle ──────────────────────────────────────────────────
-	case "Created":
-		s.transitionPhase(PhaseStarting, now)
-		return &EventInterpretation{
-			Kind:        KindProgress,
-			Phase:       PhaseStarting,
-			UserMessage: "Workspace container created, starting up…",
-			Level:       codersdk.LogLevelInfo,
-		}
-
-	case "Started":
-		s.transitionPhase(PhaseRunning, now)
-		return &EventInterpretation{
-			Kind:        KindProgress,
-			Phase:       PhaseRunning,
-			UserMessage: "Workspace is running, waiting for agent to connect…",
-			Level:       codersdk.LogLevelInfo,
-		}
-
-	case "Killing":
-		return &EventInterpretation{
-			Kind:        KindProgress,
-			Phase:       PhaseUnknown,
-			UserMessage: "Workspace container is stopping",
-			Level:       codersdk.LogLevelInfo,
-		}
-
-	case "OOMKilling", "OOMKilled":
-		return &EventInterpretation{
-			Kind:        KindRealError,
-			Phase:       PhaseFailed,
-			UserMessage: "Workspace ran out of memory (OOMKilled). Try a workspace template with more memory, or reduce your workload.",
-			Level:       codersdk.LogLevelError,
-		}
-
 	// ── Volume / PVC ─────────────────────────────────────────────────────────
 	case "FailedAttachVolume", "FailedMount":
 		elapsed := now.Sub(s.phaseEnteredAt)
@@ -322,27 +285,6 @@ func (s *podEventState) InterpretEvent(event *corev1.Event, now time.Time) *Even
 		}
 		return nil
 
-	case "SuccessfulAttachVolume", "SuccessfulMountVolume":
-		return &EventInterpretation{
-			Kind:        KindProgress,
-			Phase:       s.currentPhase,
-			UserMessage: "Workspace storage attached successfully",
-			Level:       codersdk.LogLevelInfo,
-		}
-
-	// ── Node pressure / toleration noise ────────────────────────────────────
-	case "NodeNotReady", "NodeNotSchedulable":
-		// These fire when a node briefly flaps. Almost always transient.
-		return nil
-
-	case "Preempting", "Preempted":
-		return &EventInterpretation{
-			Kind:        KindSlowWarn,
-			Phase:       PhaseScheduling,
-			UserMessage: "Workspace pod is being preempted by a higher-priority workload. It will be rescheduled shortly.",
-			Level:       codersdk.LogLevelWarn,
-		}
-
 	// ── Readiness / liveness probes ──────────────────────────────────────────
 	case "Unhealthy":
 		if containsAny(msg, "Readiness probe") {
@@ -364,14 +306,40 @@ func (s *podEventState) InterpretEvent(event *corev1.Event, now time.Time) *Even
 		return nil
 
 	default:
+		// Check static rules from event_rules.yaml
+		if rule, ok := s.staticRules.Lookup(reason); ok {
+			return s.applyStaticRule(rule, now)
+		}
 		// Silently drop anything we don't explicitly know about.
 		// This prevents raw k8s jargon from leaking to users.
 		return nil
 	}
 }
 
+// applyStaticRule converts a compiled staticRule into an EventInterpretation,
+// applying phase transitions as needed.
+func (s *podEventState) applyStaticRule(rule staticRule, now time.Time) *EventInterpretation {
+	if rule.kind == KindNoise {
+		return nil
+	}
+	// PhaseUnknown in a static rule means "keep current phase".
+	targetPhase := s.currentPhase
+	if rule.phase != PhaseUnknown {
+		targetPhase = rule.phase
+		s.transitionPhase(rule.phase, now)
+	}
+	return &EventInterpretation{
+		Kind:        rule.kind,
+		Phase:       targetPhase,
+		UserMessage: rule.message,
+		Level:       rule.level,
+	}
+}
+
 // schedulingHeartbeats and pullingHeartbeats are calm, rotating reassurances
-// used when a phase is taking longer than usual. No timers, no countdowns.
+// used when a phase is taking longer than usual.  They are also stored in
+// event_rules.yaml (heartbeats section); the YAML values take precedence when
+// loaded successfully.
 var schedulingHeartbeats = []string{
 	"Your workspace is on its way…",
 	"Node is coming up, almost there…",
@@ -389,6 +357,20 @@ var pullingHeartbeats = []string{
 // No countdowns or elapsed timers — just friendly progress nudges.
 func (s *podEventState) HeartbeatMessage(now time.Time) string {
 	elapsed := now.Sub(s.phaseEnteredAt)
+
+	// Try YAML-driven heartbeats first.
+	if s.staticRules != nil {
+		if hcfg, ok := s.staticRules.Heartbeat(s.currentPhase); ok && len(hcfg.Messages) > 0 {
+			after := time.Duration(hcfg.AfterSeconds) * time.Second
+			if elapsed > after && elapsed < 10*time.Minute {
+				idx := (int(elapsed.Seconds()) / hcfg.AfterSeconds) % len(hcfg.Messages)
+				return hcfg.Messages[idx]
+			}
+			return ""
+		}
+	}
+
+	// Fall back to hard-coded lists.
 	switch s.currentPhase {
 	case PhaseScheduling:
 		if elapsed > 60*time.Second && elapsed < 10*time.Minute {
