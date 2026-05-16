@@ -1,17 +1,8 @@
 // Package main - event_translator.go
 // Translates raw Kubernetes events into human-readable, phase-aware messages.
-// This is the core of the "smart events" concept from the provisioning UX discussion.
-//
-// Goals:
-//   - Never surface a raw k8s event reason/message directly to end users
-//   - Distinguish "expected transient noise" (autoscaler seeking a node, image pull in progress)
-//     from "real failures" (ImagePullBackOff after multiple attempts, OOMKilled, etc.)
-//   - Emit a single concise status line that updates in place (via phase tracking)
-//   - Emit a "still waiting…" heartbeat so users know progress is happening
 //
 // Simple 1:1 reason→message mappings live in event_rules.yaml (loaded via
-// event_rules_loader.go).  Cases requiring dynamic logic (backoff counting,
-// threshold checks, message extraction) are handled here.
+// event_rules_loader.go). Cases requiring dynamic logic are handled here.
 package main
 
 import (
@@ -28,13 +19,13 @@ import (
 type Phase int
 
 const (
-	PhaseUnknown Phase = iota
-	PhasePending        // pod created, not yet scheduled
-	PhaseScheduling     // scheduler is working (may be waiting for a node)
-	PhasePulling        // at least one container is pulling an image
-	PhaseStarting       // containers starting/running their init
-	PhaseRunning        // agent should be connecting soon
-	PhaseFailed         // something is genuinely wrong
+	PhaseUnknown    Phase = iota
+	PhasePending          // pod created, not yet scheduled
+	PhaseScheduling       // scheduler is working (may be waiting for a node)
+	PhasePulling          // at least one container is pulling an image
+	PhaseStarting         // containers starting their init
+	PhaseRunning          // agent should be connecting soon
+	PhaseFailed           // something is genuinely wrong
 )
 
 func (p Phase) String() string {
@@ -70,7 +61,7 @@ const (
 type EventInterpretation struct {
 	Kind        EventKind
 	Phase       Phase
-	UserMessage string // human-readable, non-k8s message
+	UserMessage string
 	Level       codersdk.LogLevel
 }
 
@@ -78,27 +69,21 @@ type EventInterpretation struct {
 // upgrading it from noise to a visible warning.
 const TransientThreshold = 90 * time.Second
 
-// podEventState tracks running state per pod so we can debounce and
-// suppress duplicate/redundant messages.
+// podEventState tracks per-pod state for debouncing and deduplication.
 type podEventState struct {
 	currentPhase     Phase
 	phaseEnteredAt   time.Time
-	lastSlowWarnSent map[string]time.Time // reason → last time we sent a slow-warn for it
-	shownReasons     map[string]struct{}  // reasons we've already surfaced at least once
-	imagePullStart   map[string]time.Time // container → time pull started
+	lastSlowWarnSent map[string]time.Time // reason → last slow-warn emission
+	shownReasons     map[string]struct{}  // reasons surfaced at least once
+	imagePullStart   map[string]time.Time // container → pull-start time
 	backoffCount     map[string]int       // container/reason → consecutive count
-	staticRules      *StaticRules         // loaded from event_rules.yaml
+	staticRules      *StaticRules
 }
 
 func newPodEventState() *podEventState {
 	rules, err := LoadStaticRules()
 	if err != nil {
-		// Should never happen (YAML is embedded); fall back to empty rules
-		// rather than panicking so the binary still runs.
-		rules = &StaticRules{
-			byReason:   map[string]staticRule{},
-			heartbeats: map[Phase]HeartbeatConfig{},
-		}
+		rules = &StaticRules{byReason: map[string]staticRule{}, heartbeats: map[Phase]HeartbeatConfig{}}
 	}
 	return &podEventState{
 		currentPhase:     PhaseUnknown,
@@ -111,279 +96,172 @@ func newPodEventState() *podEventState {
 	}
 }
 
-// InterpretEvent translates a raw Kubernetes event into a user-friendly message
-// (or nil if the event should be silenced).
+// InterpretEvent translates a raw Kubernetes event into a user-friendly
+// message, or nil if the event should be silenced.
 func (s *podEventState) InterpretEvent(event *corev1.Event, now time.Time) *EventInterpretation {
-	reason := event.Reason
-	msg := event.Message
+	reason, msg := event.Reason, event.Message
 
 	switch reason {
-	// ── Scheduling ───────────────────────────────────────────────────────────
+
 	case "Scheduled":
 		s.transitionPhase(PhaseScheduling, now)
-		node := extractNodeFromScheduled(msg)
-		if node != "" {
-			return &EventInterpretation{
-				Kind:        KindProgress,
-				Phase:       PhaseScheduling,
-				UserMessage: fmt.Sprintf("Workspace assigned to node %s", node),
-				Level:       codersdk.LogLevelInfo,
-			}
+		text := "Workspace assigned to a node, preparing to start"
+		if node := extractNodeFromScheduled(msg); node != "" {
+			text = "Workspace assigned to node " + node
 		}
-		return &EventInterpretation{
-			Kind:        KindProgress,
-			Phase:       PhaseScheduling,
-			UserMessage: "Workspace assigned to a node, preparing to start",
-			Level:       codersdk.LogLevelInfo,
-		}
+		return info(KindProgress, PhaseScheduling, text)
 
 	case "FailedScheduling":
-		// Could be transient (autoscaler is spinning up a node) or real.
-		// Heuristic: if we've been in this state < threshold, it's noise.
-		elapsed := now.Sub(s.phaseEnteredAt)
 		s.transitionPhase(PhaseScheduling, now)
-
-		// Check for specific patterns that indicate autoscaler activity
-		if containsAny(msg, "0/", "nodes are available", "Insufficient", "node(s) had") {
-			if elapsed < TransientThreshold {
-				// Autoscaler is likely working. Show once, quietly.
-				if _, shown := s.shownReasons[reason]; !shown {
-					s.shownReasons[reason] = struct{}{}
-					return &EventInterpretation{
-						Kind:        KindProgress,
-						Phase:       PhaseScheduling,
-						UserMessage: "Waiting for an available node (cluster may be scaling up)…",
-						Level:       codersdk.LogLevelInfo,
-					}
-				}
-				return nil // silence repeats
-			}
-			// Past threshold — upgrade to a visible warning
-			last := s.lastSlowWarnSent[reason]
-			if now.Sub(last) > 60*time.Second {
-				s.lastSlowWarnSent[reason] = now
-				return &EventInterpretation{
-					Kind:        KindSlowWarn,
-					Phase:       PhaseScheduling,
-					UserMessage: "Still waiting for a node — the cluster is scaling up in the background. No action needed.",
-					Level:       codersdk.LogLevelWarn,
-				}
-			}
+		if !containsAny(msg, "0/", "nodes are available", "Insufficient", "node(s) had") {
+			return nil
 		}
-		return nil
+		return s.showOnceOrThrottle(reason, now,
+			"Waiting for an available node (cluster may be scaling up)…",
+			"Still waiting for a node — the cluster is scaling up in the background. No action needed.",
+			PhaseScheduling,
+		)
 
-	// ── Image pull ───────────────────────────────────────────────────────────
 	case "Pulling":
 		container := extractContainerFromMsg(msg)
 		s.imagePullStart[container] = now
 		s.transitionPhase(PhasePulling, now)
-
-		image := extractImageFromMsg(msg)
-		if image != "" {
-			return &EventInterpretation{
-				Kind:        KindProgress,
-				Phase:       PhasePulling,
-				UserMessage: fmt.Sprintf("Downloading workspace image: %s", shortenImage(image)),
-				Level:       codersdk.LogLevelInfo,
-			}
+		text := "Downloading workspace image…"
+		if image := extractImageFromMsg(msg); image != "" {
+			text = "Downloading workspace image: " + shortenImage(image)
 		}
-		return &EventInterpretation{
-			Kind:        KindProgress,
-			Phase:       PhasePulling,
-			UserMessage: "Downloading workspace image…",
-			Level:       codersdk.LogLevelInfo,
-		}
+		return info(KindProgress, PhasePulling, text)
 
 	case "Pulled":
-		image := extractImageFromMsg(msg)
 		container := extractContainerFromMsg(msg)
 		elapsed := ""
 		if start, ok := s.imagePullStart[container]; ok {
 			elapsed = fmt.Sprintf(" (took %s)", now.Sub(start).Round(time.Second))
+			delete(s.imagePullStart, container)
 		}
-		delete(s.imagePullStart, container)
 		s.transitionPhase(PhaseStarting, now)
-		return &EventInterpretation{
-			Kind:        KindProgress,
-			Phase:       PhaseStarting,
-			UserMessage: fmt.Sprintf("Image ready%s: %s", elapsed, shortenImage(image)),
-			Level:       codersdk.LogLevelInfo,
-		}
-
-	case "ErrImageNeverPull":
-		return &EventInterpretation{
-			Kind:        KindRealError,
-			Phase:       PhaseFailed,
-			UserMessage: fmt.Sprintf("Image cannot be pulled (policy=Never and image is not present): %s", extractImageFromMsg(msg)),
-			Level:       codersdk.LogLevelError,
-		}
+		return info(KindProgress, PhaseStarting,
+			fmt.Sprintf("Image ready%s: %s", elapsed, shortenImage(extractImageFromMsg(msg))))
 
 	case "BackOff":
-		if containsAny(msg, "image", "pull") {
-			// ImagePullBackOff — transient initially, real after N occurrences.
-			container := extractContainerFromMsg(msg)
-			s.backoffCount[container]++
-			count := s.backoffCount[container]
-			if count < 3 {
-				// Probably still pulling or retrying — show once quietly.
-				if count == 1 {
-					return &EventInterpretation{
-						Kind:        KindProgress,
-						Phase:       PhasePulling,
-						UserMessage: "Image pull is taking longer than expected, retrying…",
-						Level:       codersdk.LogLevelWarn,
-					}
-				}
-				return nil
-			}
-			// 3+ backoffs: surface as an error
-			return &EventInterpretation{
-				Kind:        KindRealError,
-				Phase:       PhaseFailed,
-				UserMessage: fmt.Sprintf("Workspace image pull keeps failing (attempt %d). Check the image name/registry or contact your administrator.", count),
-				Level:       codersdk.LogLevelError,
-			}
-		}
-		// CrashLoopBackOff or similar
-		container := extractContainerFromMsg(msg)
-		s.backoffCount[container]++
-		count := s.backoffCount[container]
-		if count < 3 {
-			return nil
-		}
-		return &EventInterpretation{
-			Kind:        KindRealError,
-			Phase:       PhaseFailed,
-			UserMessage: fmt.Sprintf("Workspace container keeps crashing (attempt %d). Check your workspace template configuration.", count),
-			Level:       codersdk.LogLevelError,
-		}
+		return s.handleBackOff(msg)
 
-	// ── Volume / PVC ─────────────────────────────────────────────────────────
 	case "FailedAttachVolume", "FailedMount":
-		elapsed := now.Sub(s.phaseEnteredAt)
-		if elapsed < TransientThreshold {
-			if _, shown := s.shownReasons[reason]; !shown {
-				s.shownReasons[reason] = struct{}{}
-				return &EventInterpretation{
-					Kind:        KindProgress,
-					Phase:       s.currentPhase,
-					UserMessage: "Waiting for workspace storage to attach…",
-					Level:       codersdk.LogLevelInfo,
-				}
-			}
-			return nil
-		}
-		last := s.lastSlowWarnSent[reason]
-		if now.Sub(last) > 60*time.Second {
-			s.lastSlowWarnSent[reason] = now
-			return &EventInterpretation{
-				Kind:        KindSlowWarn,
-				Phase:       s.currentPhase,
-				UserMessage: "Storage is taking a while to attach — this can happen when re-attaching across zones. Hang tight.",
-				Level:       codersdk.LogLevelWarn,
-			}
-		}
-		return nil
+		return s.showOnceOrThrottle(reason, now,
+			"Waiting for workspace storage to attach…",
+			"Storage is taking a while to attach — this can happen when re-attaching across zones. Hang tight.",
+			s.currentPhase,
+		)
 
-	// ── Readiness / liveness probes ──────────────────────────────────────────
 	case "Unhealthy":
-		if containsAny(msg, "Readiness probe") {
-			// Readiness probe failures during startup are completely expected.
-			return nil
-		}
-		if containsAny(msg, "Liveness probe") {
-			s.backoffCount["liveness"]++
-			if s.backoffCount["liveness"] < 3 {
-				return nil
-			}
-			return &EventInterpretation{
-				Kind:        KindRealError,
-				Phase:       PhaseFailed,
-				UserMessage: "Workspace container liveness probe keeps failing. The workspace may be misconfigured or crashing.",
-				Level:       codersdk.LogLevelError,
-			}
-		}
-		return nil
+		return s.handleUnhealthy(msg)
 
 	default:
-		// Check static rules from event_rules.yaml
 		if rule, ok := s.staticRules.Lookup(reason); ok {
 			return s.applyStaticRule(rule, now)
 		}
-		// Silently drop anything we don't explicitly know about.
-		// This prevents raw k8s jargon from leaking to users.
+		return nil // silently drop unknown events — never leak raw k8s jargon
+	}
+}
+
+// HeartbeatMessage returns a calm reassurance when a phase is taking a while.
+func (s *podEventState) HeartbeatMessage(now time.Time) string {
+	hcfg, ok := s.staticRules.Heartbeat(s.currentPhase)
+	if !ok || len(hcfg.Messages) == 0 {
+		return ""
+	}
+	elapsed := now.Sub(s.phaseEnteredAt)
+	after := time.Duration(hcfg.AfterSeconds) * time.Second
+	if elapsed < after || elapsed > 10*time.Minute {
+		return ""
+	}
+	return hcfg.Messages[(int(elapsed.Seconds())/hcfg.AfterSeconds)%len(hcfg.Messages)]
+}
+
+// ── private helpers ───────────────────────────────────────────────────────────
+
+// showOnceOrThrottle implements the common pattern:
+//   - before TransientThreshold: show firstMsg once, then silence
+//   - after TransientThreshold: show slowMsg at most once per 60s
+func (s *podEventState) showOnceOrThrottle(reason string, now time.Time, firstMsg, slowMsg string, phase Phase) *EventInterpretation {
+	if now.Sub(s.phaseEnteredAt) < TransientThreshold {
+		if _, shown := s.shownReasons[reason]; shown {
+			return nil
+		}
+		s.shownReasons[reason] = struct{}{}
+		return info(KindProgress, phase, firstMsg)
+	}
+	if now.Sub(s.lastSlowWarnSent[reason]) <= 60*time.Second {
+		return nil
+	}
+	s.lastSlowWarnSent[reason] = now
+	return &EventInterpretation{Kind: KindSlowWarn, Phase: phase, UserMessage: slowMsg, Level: codersdk.LogLevelWarn}
+}
+
+// handleBackOff handles BackOff events (ImagePullBackOff and CrashLoopBackOff).
+func (s *podEventState) handleBackOff(msg string) *EventInterpretation {
+	if containsAny(msg, "image", "pull") {
+		return s.countedBackoff("pull:"+extractContainerFromMsg(msg), PhasePulling,
+			"Image pull is taking longer than expected, retrying…",
+			"Workspace image pull keeps failing (attempt %d). Check the image name/registry or contact your administrator.")
+	}
+	return s.countedBackoff(extractContainerFromMsg(msg), PhaseFailed,
+		"", // no first-occurrence message for crash loops
+		"Workspace container keeps crashing (attempt %d). Check your workspace template configuration.")
+}
+
+// countedBackoff increments the counter for key and returns:
+//   - firstMsg (info) on the first occurrence (if non-empty)
+//   - nil while count < 3
+//   - error with errFmt (printf, %d=count) once count reaches 3+
+func (s *podEventState) countedBackoff(key string, phase Phase, firstMsg, errFmt string) *EventInterpretation {
+	s.backoffCount[key]++
+	count := s.backoffCount[key]
+	switch {
+	case count == 1 && firstMsg != "":
+		return &EventInterpretation{Kind: KindProgress, Phase: phase, UserMessage: firstMsg, Level: codersdk.LogLevelWarn}
+	case count < 3:
+		return nil
+	default:
+		return &EventInterpretation{Kind: KindRealError, Phase: PhaseFailed,
+			UserMessage: fmt.Sprintf(errFmt, count), Level: codersdk.LogLevelError}
+	}
+}
+
+// handleUnhealthy handles probe failures:
+//   - readiness probes during startup → always silent
+//   - liveness probes → silent until 3+ failures, then error
+func (s *podEventState) handleUnhealthy(msg string) *EventInterpretation {
+	switch {
+	case containsAny(msg, "Readiness probe"):
+		return nil
+	case containsAny(msg, "Liveness probe"):
+		s.backoffCount["liveness"]++
+		if s.backoffCount["liveness"] < 3 {
+			return nil
+		}
+		return &EventInterpretation{
+			Kind:        KindRealError,
+			Phase:       PhaseFailed,
+			UserMessage: "Workspace container liveness probe keeps failing. The workspace may be misconfigured or crashing.",
+			Level:       codersdk.LogLevelError,
+		}
+	default:
 		return nil
 	}
 }
 
-// applyStaticRule converts a compiled staticRule into an EventInterpretation,
-// applying phase transitions as needed.
+// applyStaticRule converts a compiled staticRule into an EventInterpretation.
 func (s *podEventState) applyStaticRule(rule staticRule, now time.Time) *EventInterpretation {
 	if rule.kind == KindNoise {
 		return nil
 	}
-	// PhaseUnknown in a static rule means "keep current phase".
-	targetPhase := s.currentPhase
+	phase := s.currentPhase
 	if rule.phase != PhaseUnknown {
-		targetPhase = rule.phase
+		phase = rule.phase
 		s.transitionPhase(rule.phase, now)
 	}
-	return &EventInterpretation{
-		Kind:        rule.kind,
-		Phase:       targetPhase,
-		UserMessage: rule.message,
-		Level:       rule.level,
-	}
-}
-
-// schedulingHeartbeats and pullingHeartbeats are calm, rotating reassurances
-// used when a phase is taking longer than usual.  They are also stored in
-// event_rules.yaml (heartbeats section); the YAML values take precedence when
-// loaded successfully.
-var schedulingHeartbeats = []string{
-	"Your workspace is on its way…",
-	"Node is coming up, almost there…",
-	"Cluster is getting things ready for you…",
-	"Hang tight, a node is spinning up…",
-}
-
-var pullingHeartbeats = []string{
-	"Image is downloading, nearly ready…",
-	"Large image — still pulling, won't be long…",
-	"Almost there, image transfer in progress…",
-}
-
-// HeartbeatMessage returns a calm reassurance if we've been in a slow phase.
-// No countdowns or elapsed timers — just friendly progress nudges.
-func (s *podEventState) HeartbeatMessage(now time.Time) string {
-	elapsed := now.Sub(s.phaseEnteredAt)
-
-	// Try YAML-driven heartbeats first.
-	if s.staticRules != nil {
-		if hcfg, ok := s.staticRules.Heartbeat(s.currentPhase); ok && len(hcfg.Messages) > 0 {
-			after := time.Duration(hcfg.AfterSeconds) * time.Second
-			if elapsed > after && elapsed < 10*time.Minute {
-				idx := (int(elapsed.Seconds()) / hcfg.AfterSeconds) % len(hcfg.Messages)
-				return hcfg.Messages[idx]
-			}
-			return ""
-		}
-	}
-
-	// Fall back to hard-coded lists.
-	switch s.currentPhase {
-	case PhaseScheduling:
-		if elapsed > 60*time.Second && elapsed < 10*time.Minute {
-			idx := (int(elapsed.Seconds()) / 60) % len(schedulingHeartbeats)
-			return schedulingHeartbeats[idx]
-		}
-	case PhasePulling:
-		if elapsed > 45*time.Second && elapsed < 10*time.Minute {
-			idx := (int(elapsed.Seconds()) / 45) % len(pullingHeartbeats)
-			return pullingHeartbeats[idx]
-		}
-	}
-	return ""
+	return &EventInterpretation{Kind: rule.kind, Phase: phase, UserMessage: rule.message, Level: rule.level}
 }
 
 func (s *podEventState) transitionPhase(p Phase, now time.Time) {
@@ -393,7 +271,12 @@ func (s *podEventState) transitionPhase(p Phase, now time.Time) {
 	}
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// info is a convenience constructor for KindProgress / LogLevelInfo results.
+func info(kind EventKind, phase Phase, msg string) *EventInterpretation {
+	return &EventInterpretation{Kind: kind, Phase: phase, UserMessage: msg, Level: codersdk.LogLevelInfo}
+}
+
+// ── string helpers ────────────────────────────────────────────────────────────
 
 func containsAny(s string, subs ...string) bool {
 	sl := strings.ToLower(s)
@@ -406,8 +289,6 @@ func containsAny(s string, subs ...string) bool {
 }
 
 func extractImageFromMsg(msg string) string {
-	// "Pulling image "docker.io/foo/bar:latest""
-	// "Successfully pulled image "docker.io/foo/bar:latest""
 	lower := strings.ToLower(msg)
 	for _, prefix := range []string{`pulling image "`, `pulled image "`, `failed to pull image "`} {
 		if idx := strings.Index(lower, prefix); idx != -1 {
@@ -421,8 +302,6 @@ func extractImageFromMsg(msg string) string {
 }
 
 func extractContainerFromMsg(msg string) string {
-	// "Back-off pulling image "..." for container "mycontainer""
-	// "Container mycontainer failed liveness probe"
 	if idx := strings.Index(msg, `container "`); idx != -1 {
 		rest := msg[idx+len(`container "`):]
 		if end := strings.Index(rest, `"`); end != -1 {
@@ -433,24 +312,18 @@ func extractContainerFromMsg(msg string) string {
 }
 
 func extractNodeFromScheduled(msg string) string {
-	// "Successfully assigned default/mypod to ip-10-0-1-5.us-east-2.compute.internal"
-	const to = " to "
-	if idx := strings.Index(msg, to); idx != -1 {
-		return msg[idx+len(to):]
+	// "Successfully assigned default/mypod to <node>"
+	if idx := strings.Index(msg, " to "); idx != -1 {
+		return msg[idx+4:]
 	}
 	return ""
 }
 
 func shortenImage(image string) string {
-	// Strip registry prefix for common registries to save space
 	for _, prefix := range []string{
-		"docker.io/library/",
-		"docker.io/",
-		"index.docker.io/library/",
-		"index.docker.io/",
-		"ghcr.io/",
-		"gcr.io/",
-		"quay.io/",
+		"docker.io/library/", "docker.io/",
+		"index.docker.io/library/", "index.docker.io/",
+		"ghcr.io/", "gcr.io/", "quay.io/",
 	} {
 		if strings.HasPrefix(image, prefix) {
 			return image[len(prefix):]

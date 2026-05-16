@@ -67,7 +67,7 @@ rules:
     kind: error
     phase: failed
     level: error
-    message: "Image can't be pulled (imagePullPolicy=Never but image isn't present locally)."
+    message: "Image can't be pulled (imagePullPolicy=Never and image isn't cached locally). Fix the image name or pull policy."
 
 # Heartbeat messages shown when a phase stalls (rotated, no timers shown to user)
 heartbeats:
